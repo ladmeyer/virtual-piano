@@ -1,0 +1,20 @@
+{
+	"folders": [
+		{
+			"path": "."
+		},
+		{
+			"path": "../CSCI 371 Archive/hw09"
+		}
+	],
+	"settings": {
+		"files.associations": {
+			"istream": "cpp",
+			"streambuf": "cpp",
+			"algorithm": "cpp",
+			"cstdlib": "cpp",
+			"array": "cpp",
+			"vector": "cpp"
+		}
+	}
+}

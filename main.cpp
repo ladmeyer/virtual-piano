@@ -1,516 +1,911 @@
 // #define COW_PATCH_FRAMERATE
 // #define COW_PATCH_FRAMERATE_SLEEP
+
+#define COW_NO_SOUND
 #include "include.cpp"
 
-////////////////////////////////////////////////////////////////////////////////
-// pendulum simulation /////////////////////////////////////////////////////////
-////////////////////////////////////////////////////////////////////////////////
+// stk
+#undef PI
+#include "SineWave.h"
+#include "RtWvOut.h"
+#include "BeeThree.h"
+#include "Clarinet.h"
+#include "Mandolin.h"
+#include "Wurley.h"
+#include "Bowed.h"
+#include "RtAudio.h"
+#include "Voicer.h"
+#include "Messager.h"
+#include "SKINImsg.h"
+#include <cstdlib>
+#include <algorithm>
+using std::min;
+using namespace stk;
 
-#define PENDULUM_SIMULATION_MODE_EXPLICIT 0
-#define PENDULUM_SIMULATION_MODE_SEMI_IMPLICIT 1
-#define PENDULUM_SIMULATION_MODE_IMPLICIT 2
-#define _PENDULUM_SIMULATION_MODE_COUNT 3
-char *_pendulum_simulation_mode_names[] = {
-    "explicit euler",
-    "semi-implicit euler",
-    "implicit_euler",
+#define WHITE_KEY_NUM 52
+#define BLACK_KEY_NUM 36
+
+#define KEY_FULL 0
+#define KEY_LEFT 1
+#define KEY_RIGHT 2
+#define KEY_CENTER 3
+#define KEY_BLACK 4
+
+// The TickData structure holds all the class instances and data that
+// are shared by the various processing functions.
+struct TickData {
+  Voicer voicer;
+  Messager messager;
+  Skini::Message message;
+  int counter;
+  bool haveMessage;
+  bool done;
+
+  // Default constructor.
+  TickData()
+    : counter(0), haveMessage(false), done( false ) {}
 };
 
+#define DELTA_CONTROL_TICKS 64 // default sample frames between control input checks
 
-// // parameters
-// h is the simulation timestep
-// g is the (signed) gravitational acceleration
-// L is the length
+// The processMessage() function encapsulates the handling of control
+// messages.  It can be easily relocated within a program structure
+// depending on the desired scheduling scheme.
+void processMessage( TickData* data )
+{
+  register StkFloat value1 = data->message.floatValues[0];
+  register StkFloat value2 = data->message.floatValues[1];
 
-// // state is { theta, omega }
-// theta is the angle of the pendulum, measured counter-clockwise from the negative y-axix
-// omega is the angular velocity of the pendulum
+  switch( data->message.type ) {
 
-// NOTE: alpha is the angular acceleration of the pendulum
+  case __SK_Exit_:
+    data->done = true;
+    return;
 
-
-// simulate the pendulum forward one timestep and return the result (the next state)
-// curr state is \xi_k = { \theta_k, \omega_k }
-// next state is \xi_{ k + 1 } = { \theta_{k + 1}, \omega_{k + 1} }
-vec2 step_forward_in_time(vec2 curr, int mode, real h, real g, real L) {
-    // alpha is the angular acceleration of the pendulum
-    // this is a lambda (local) function you can call just like a regular function
-    auto get_alpha = [&](real theta) {
-        return g / L * sin(theta);
-    };
-
-    vec2 next = curr;
-    if (mode == PENDULUM_SIMULATION_MODE_EXPLICIT) {
-        // TODO: explicit Euler
-
-    } else if (mode == PENDULUM_SIMULATION_MODE_SEMI_IMPLICIT) {
-        // TODO: semi-implicit Euler
-
-    } else if (mode == PENDULUM_SIMULATION_MODE_IMPLICIT) {
-        // TODO: implicit Euler
-
+  case __SK_NoteOn_:
+    if ( value2 == 0.0 ) // velocity is zero ... really a NoteOff
+      data->voicer.noteOff( value1, 64.0 );
+    else { // a NoteOn
+      data->voicer.noteOn( value1, value2 );
     }
-    return next;
+    break;
+
+  case __SK_NoteOff_:
+    data->voicer.noteOff( value1, value2 );
+    break;
+
+  case __SK_ControlChange_:
+    data->voicer.controlChange( (int) value1, value2 );
+    break;
+
+  case __SK_AfterTouch_:
+    data->voicer.controlChange( 128, value1 );
+
+  case __SK_PitchChange_:
+    data->voicer.setFrequency( value1 );
+    break;
+
+  case __SK_PitchBend_:
+    data->voicer.pitchBend( value1 );
+
+  } // end of switch
+
+  data->haveMessage = false;
+  return;
 }
 
+// This tick() function handles sample computation and scheduling of
+// control updates.  It will be called automatically when the system
+// needs a new buffer of audio samples.
+int tick_synth( void *outputBuffer, void *inputBuffer, unsigned int nBufferFrames,
+         double streamTime, RtAudioStreamStatus status, void *dataPointer )
+{
+  TickData *data = (TickData *) dataPointer;
+  register StkFloat *samples = (StkFloat *) outputBuffer;
+  int counter, nTicks = (int) nBufferFrames;
 
-void hw10a() {
-    vec2 state = { RAD(90.0), 0.0 };
-    int mode = 0;
+  while ( nTicks > 0 && !data->done ) {
 
-    real h = 0.0167; 
-    real g = -9.81;  
-    real L = 1.0;    
+    if ( !data->haveMessage ) {
+      data->messager.popMessage( data->message );
+      if ( data->message.type > 0 ) {
+        data->counter = (long) (data->message.time * Stk::sampleRate());
+        data->haveMessage = true;
+      }
+      else
+        data->counter = DELTA_CONTROL_TICKS;
+    }
 
-    bool paused = false;
-    Camera2D camera = { 5.35, 0, -.75 };
-    while (cow_begin_frame()) {
+    counter = min( nTicks, data->counter );
+    data->counter -= counter;
+
+    for ( int i=0; i<counter; i++ ) {
+      *samples++ = data->voicer.tick();
+      nTicks--;
+    }
+    if ( nTicks == 0 ) break;
+
+    // Process control messages.
+    if ( data->haveMessage ) processMessage( data );
+  }
+
+  return 0;
+}
+
+// REMINDER: translation, then rotation, then scaling
+
+// draw a rectangular prism w/ origin as its lower left corner with specified dimensions
+void draw_prism(mat4 P, mat4 V, mat4 M, vec3 origin, vec3 dimensions, vec3 color) {
+    // makes "lower-left corner" of prism its origin
+    mat4 translation = M4_Translation(V3(dimensions.x / 2, dimensions.y / 2, -dimensions.z / 2) + origin);
+    mat4 scaling = M4_Scaling(dimensions.x / 2, dimensions.y / 2, dimensions.z / 2);
+    library.meshes.box.draw(P, V, M * translation * scaling, color);
+}
+
+// draw a white key that is not bordered by any black keys
+void draw_full_white_key(mat4 P, mat4 V, mat4 M, vec3 origin, vec3 color) {
+    draw_prism(P, V, M, origin, V3(0.2, 0.15, 1.0), color);
+    return;
+}
+
+// draw a white key that is to the left of one black key
+void draw_left_white_key(mat4 P, mat4 V, mat4 M, vec3 origin, vec3 color) {
+    // draws the thicker part of the key
+    draw_prism(P, V, M, origin, V3(0.2, 0.15, 0.333), color);
+    // draws the thinner part of the key
+    draw_prism(P, V, M, origin + V3(0.0, 0.0, -0.333), V3(0.15, 0.15, 0.666), color);
+    return;
+}
+
+// draw a white key that is to the right of one black key
+void draw_right_white_key(mat4 P, mat4 V, mat4 M, vec3 origin, vec3 color) {
+    // draws the thicker part of the key
+    draw_prism(P, V, M, origin, V3(0.2, 0.15, 0.333), color);
+    // draws the thinner part of the key
+    draw_prism(P, V, M, origin + V3(0.05, 0.0, -0.333), V3(0.15, 0.15, 0.666), color);
+    return;
+}
+
+// draw a white key that is between two black keys
+void draw_center_white_key(mat4 P, mat4 V, mat4 M, vec3 origin, vec3 color) {
+    // draws the thicker part of the key
+    draw_prism(P, V, M, origin, V3(0.2, 0.15, 0.333), color);
+    // draws the thinner part of the key
+    draw_prism(P, V, M, origin + V3(0.05, 0.0, -0.333), V3(0.1, 0.15, 0.666), color);
+    return;
+}
+
+// draw a black key :)
+void draw_black_key(mat4 P, mat4 V, mat4 M, vec3 origin, vec3 color) {
+    draw_prism(P, V, M, origin, V3(0.1, 0.25, 0.65), color);
+}
+
+void play_white_note(int note_id, long tags[], int octave, StretchyBuffer<vec3> white_key_colors, StretchyBuffer<vec3> white_key_positions) {
+    white_key_colors.data[note_id + (7 * octave)] = monokai.yellow;
+    white_key_positions.data[note_id + (7 * octave)] -= V3(0.0, 0.1, 0.0);      
+}
+
+void stop_white_note(int note_id, long tags[], int octave, StretchyBuffer<vec3> white_key_colors, StretchyBuffer<vec3> white_key_positions) {
+    white_key_colors.data[note_id + (7 * octave)] = monokai.white;
+    white_key_positions.data[note_id + (7 * octave)] += V3(0.0, 0.1, 0.0);
+}
+
+void play_black_note(int note_id, long tags[], int octave, StretchyBuffer<vec3> black_key_colors, StretchyBuffer<vec3> black_key_positions) {
+    black_key_colors.data[note_id + (5 * octave)] = monokai.purple;
+    black_key_positions.data[note_id + (5 * octave)] -= V3(0.0, 0.1, 0.0);
+}
+
+void stop_black_note(int note_id, long tags[], int octave, StretchyBuffer<vec3> black_key_colors, StretchyBuffer<vec3> black_key_positions) {
+    black_key_colors.data[note_id + (5 * octave)] = monokai.blue;
+    black_key_positions.data[note_id + (5 * octave)] += V3(0.0, 0.1, 0.0);
+}
+
+void final_project () {
+    // stk setup code
+    // set the global sample rate and rawwave path
+    Stk::setSampleRate( 44100.0 );
+    Stk::setRawwavePath( "stk/rawwaves/" );
+
+    // initialize instrument (we can play 6 simultaneous notes)
+    int i;
+    TickData data;
+    RtAudio dac;
+    Instrmnt *instrument[6];
+    for ( i=0; i<6; i++ ) { 
+        instrument[i] = 0;
+    }
+
+    // setup the RtAudio stream
+    RtAudio::StreamParameters parameters;
+    parameters.deviceId = dac.getDefaultOutputDevice();
+    parameters.nChannels = 1;
+    RtAudioFormat format = ( sizeof(StkFloat) == 8 ) ? RTAUDIO_FLOAT64 : RTAUDIO_FLOAT32;
+    unsigned int bufferFrames = RT_BUFFER_SIZE;
+
+    dac.openStream( &parameters, NULL, format, (unsigned int)Stk::sampleRate(), &bufferFrames, &tick_synth, (void *)&data );
+
+    // define and load the instruments
+    for ( i=0; i<6; i++ ) {
+        instrument[i] = new Wurley();
+    }
+
+    // add the instruments to the voicer
+    for ( i=0; i<6; i++ ) {
+        data.voicer.addInstrument( instrument[i] );
+    }
+
+    dac.startStream();
+    // piano range in MIDI note values is 21 through 108
+    long tags[128];
+
+    Camera3D camera = {3.0};
+
+    // fill white key position & color buffers
+    StretchyBuffer<vec3> white_key_positions = {};
+    StretchyBuffer<vec3> white_key_colors = {};
+    for (int i = 0; i < WHITE_KEY_NUM; i++) {
+        // since keys are 0.2 units wide, this leaves 0.02 units of space between them
+        sbuff_push_back(&white_key_positions, V3(i * 0.22, 0.0, 0.0));        
+        sbuff_push_back(&white_key_colors, monokai.white);
+    }
+
+    // fill key type buffer to reflect standard 52-key layout
+    StretchyBuffer<int> white_key_types = {};
+    // low A and B
+    { sbuff_push_back(&white_key_types, KEY_LEFT);
+    sbuff_push_back(&white_key_types, KEY_RIGHT);
+    }
+    // 7 full octaves
+    for (int i = 0; i < 7; i++) { 
+    sbuff_push_back(&white_key_types, KEY_LEFT);
+    sbuff_push_back(&white_key_types, KEY_CENTER);
+    sbuff_push_back(&white_key_types, KEY_RIGHT);
+    sbuff_push_back(&white_key_types, KEY_LEFT);
+    sbuff_push_back(&white_key_types, KEY_CENTER);
+    sbuff_push_back(&white_key_types, KEY_CENTER);
+    sbuff_push_back(&white_key_types, KEY_RIGHT);
+    }
+    // top C
+    sbuff_push_back(&white_key_types, KEY_FULL);
+
+    // fill black key position & color buffers; this process is dependent on white key types
+    StretchyBuffer<vec3> black_key_positions = {};
+    StretchyBuffer<vec3> black_key_colors = {};
+    int black_key_num = BLACK_KEY_NUM;
+    for (int i = 0; i < WHITE_KEY_NUM; i++) {
+        // if there should be a black key to the right of the current white key...
+        if (white_key_types[i] == KEY_LEFT or white_key_types[i] == KEY_CENTER) {
+            // add it to the position buffer!
+            sbuff_push_back(&black_key_positions, white_key_positions[i] + V3(0.16, 0.0, -0.34));
+            sbuff_push_back(&black_key_colors, monokai.blue);
+        }
+    }
+
+    int octave = 4;
+
+    while (cow_begin_frame()) { 
+        mat4 P = camera_get_P(&camera);
+        mat4 V = camera_get_V(&camera);
+        mat4 M = globals.Identity;
+
         camera_move(&camera);
-        mat4 PV = camera_get_PV(&camera);
-        bool reset = false;
 
-        if (!paused) {
-            state = step_forward_in_time(state, mode, h, g, L);
+        gui_slider("octave", &octave, 0, 7);
+        if (globals.key_pressed['n'] && octave != 0) {
+            octave -= 1;
+        }
+        if (globals.key_pressed['m'] && octave != 7) {
+            octave += 1;
         }
 
-        { // gui
-            gui_slider("h", &h, .001, .1);
-            gui_slider("L", &L, .1, 5);
-            gui_slider("g", &g, -24, 24);
-            gui_printf("");
-                gui_slider("mode", &mode, 0, _PENDULUM_SIMULATION_MODE_COUNT - 1, 'j', 'k', true);
-                gui_printf("mode: %s", _pendulum_simulation_mode_names[mode]);
-            gui_printf("");
-            gui_checkbox("paused", &paused, 'p');
-            gui_printf("");
-            { // reset
-                static vec2 _state = state;
-                if (gui_button("reset", 'r')) {
-                    reset = true;
-                    state = _state;
-                    // sbuff_free(&trace_positions);
-                }
+        // randomize keyboard layout :0
+        if (globals.key_pressed[COW_KEY_SPACE]) {
+            black_key_num = 0;
+            sbuff_free(&white_key_types);
+
+            if (random_sign() > 0) {
+                sbuff_push_back(&white_key_types, 0);
+            } else {
+                sbuff_push_back(&white_key_types, 1);
+                black_key_num += 1;
             }
-            gui_printf("");
-            gui_readout("theta", &state[0]);
-            gui_readout("omega", &state[1]);
-        }
 
-        { // draw / drag
-            vec2 p = L * V2(sin(state[0]), -cos(state[0]));
-
-            { // trace
-                #define TRACE_LENGTH 128
-                static vec3 trace_colors[TRACE_LENGTH];
-                static StretchyBuffer<vec2> trace_positions = {};
-                if (reset) { sbuff_free(&trace_positions); }
-
-                static bool initialized;
-                if (!initialized) {
-                    initialized = true;
-
-                    for (int i = 0; i < TRACE_LENGTH; ++i) {
-                        trace_colors[i] = color_plasma(real(i) / real(TRACE_LENGTH - 1));
+            for (int i = 1; i < WHITE_KEY_NUM; i++) {
+                if (white_key_types[i - 1] == KEY_FULL or white_key_types[i - 1] == KEY_RIGHT) {
+                    if (random_sign() > 0) {
+                        sbuff_push_back(&white_key_types, 0);
+                    } else {
+                        sbuff_push_back(&white_key_types, 1);
+                        black_key_num += 1;
                     }
-                }
-
-                if (trace_positions.length < TRACE_LENGTH) {
-                    sbuff_push_back(&trace_positions, p);
                 } else {
-                    memmove(trace_positions.data, trace_positions.data + 1, (TRACE_LENGTH - 1) * sizeof(vec2));
-                    trace_positions.data[TRACE_LENGTH - 1] = p;
-                }
-                soup_draw(PV, SOUP_LINE_STRIP, trace_positions.length, trace_positions.data, trace_colors);
-            }
-
-            { // pendulum
-                eso_color(monokai.white);
-                eso_begin(PV, SOUP_LINES);
-                eso_vertex(V2(0, 0));
-                eso_vertex(p);
-                eso_end();
-
-                eso_color(monokai.yellow);
-                eso_begin(PV, SOUP_POINTS, 16.0);
-                eso_vertex(p);
-                eso_end();
-
-                if (widget_drag(PV, 1, &p)) {
-                    p = L * normalized(p);
-                    state[1] = 0;
-                    state[0] = RAD(90) + atan2(p.y, p.x);
+                    if (random_sign() > 0) {
+                        sbuff_push_back(&white_key_types, 2);
+                    } else {
+                        sbuff_push_back(&white_key_types, 3);
+                        black_key_num += 1;
+                    }
                 }
             }
 
-            { // energy plot
-                static Plot plot = { 128 };
-                if (plot.num_traces == 0) {
-                    plot_add_trace(&plot, 0.0, 32.0, monokai.blue);
-                    plot_add_trace(&plot, 0.0, 32.0, monokai.red);
-                    plot_add_trace(&plot, 0.0, 32.0, monokai.purple);
-                }
-                if (reset) {
-                    plot_clear(&plot);
-                }
-
-                mat4 PV_plot = M4_Translation(.3, -.3) * M4_Scaling(.5, .5 * _window_get_aspect());
-                if (!paused) {
-                    real m = 1.0;
-                    real PE = m * g * (cos(state[0]) / L - L);
-                    real KE = m * pow(L * state[1], 2) / 2.0;
-                    plot_data_point(&plot, 0, PE);
-                    plot_data_point(&plot, 1, KE);
-                    plot_data_point(&plot, 2, PE + KE);
-                }
-                plot_draw(&plot, PV_plot);
-                text_draw(PV_plot, "time", { 1.05, 0.0 });
-                text_draw(PV_plot, "energy", { 0.05, 1.0 });
-            }
-        }
-    }
-}
-
-
-
-////////////////////////////////////////////////////////////////////////////////
-// skeletal animation //////////////////////////////////////////////////////////
-////////////////////////////////////////////////////////////////////////////////
-
-#define SKELETON_ANIMATION_MODE_ONLY_ZEROTH 0
-#define SKELETON_ANIMATION_MODE_ALL_EQUAL 1
-#define SKELETON_ANIMATION_MODE_RIGID 2
-#define SKELETAL_ANIMATION_MODE_SMOOTH 3
-#define _SKELETAL_ANIMATION_MODE_COUNT 4
-char *skeletal_animation_mode_names[] = {
-    "only-zeroth",
-    "all-equal",
-    "rigid",
-    "smooth",
-};
-
-#define NUM_BONES 4
-#define NUM_NODES (32 * 2)
-
-// // parameters
-// weights[i][j] is the skinning weight of bone j on node i
-// L[j] is the length of bone j
-
-// // bind pose of the system (aka rest pose)
-// // this is the state of the system we use to calculate the weights
-// b_bind[j] is the bind position of the near end of bone j in the skeleton (in world coordinates)
-// NOTE: b_bind[0] is at the world origin
-// NOTE: b_bind[NUM_BONES] is at the far end of the final bone
-// NOTE: we assume the bind pose of the skeleton is lying along the x-axis
-//       so we do NOT define theta_bind (theta_bind is understood to be 0.0 for all bones)
-// s_bind[i] is the bind position of node i in the skin (in world coordinates)
-
-// b_bind[0]      b_bind[1]   b_bind[2]        b_bind[3]     b_bind[4]          
-// |              |           |                |             |                  
-// v              v           v                v             v                  
-// o--------------o-----------o----------------o-------------o   -> world x-axis
-// ^                                                                            
-// |                                                                            
-// world origin                                                                 
-
-// // current state of the system
-// b[j] is the current position of the near end of bone j in the skeleton (in world coordinates)
-// NOTE: b[0] should stay at the world origin forever
-// NOTE: b[NUM_BONES] is the position of the far end of the final bone
-// theta[j] is the current angle of bone j in the skeleton (in world coordinates)
-// s[i] is the current position of node i in the skin (in world coordinates)
-
-
-void update_skeleton(vec2 *b, real *L, real *theta) {
-    // TODO: calculate b
-    // (after you get this right, you should see the skeleton)
-
-}
-
-
-void update_skin(vec2 *s, real **weights, vec2 *b, real *theta, vec2 *b_bind, vec2 *s_bind) {
-    // TODO: calculate s
-    // (after you get this right, you should see the skin)
-
-}
-
-
-// helper funcion for initialize_weights
-// returns the minimum distance from point p to line segment [a, b]
-real point_segment_distance(vec2 p, vec2 a, vec2 b) {
-    real L2 = squaredNorm(a - b);
-    if (IS_ZERO(L2)) { return norm(p - a); }
-    return norm(p - LERP(MAX(0, MIN(1, dot(p - a, b - a) / L2)), a, b));
-}
-
-void initialize_weights(real **weights, int mode, vec2 *s_bind, vec2 *b_bind) {
-    for (int i = 0; i < NUM_NODES; ++i) {
-        real w_i[NUM_BONES] = {}; {
-            // TODO: calculate the i-th node's skinning weights
-            // NOTE: they start out cleared to zero
-            // NOTE: don't worry about ensuring sum(w_i) is 1 (i do it for you below)
-
-            if (mode == SKELETON_ANIMATION_MODE_ONLY_ZEROTH) {
-                // bind the node completely to the 0-th bone
-                w_i[0] = 1.0;
-            }
-            else if (mode == SKELETON_ANIMATION_MODE_ALL_EQUAL) {
-                // all bones equally-weighted
-                for (int j = 0; j < NUM_BONES; ++j) {
-                    w_i[j] = 1.0;
+            sbuff_free(&black_key_positions);
+            sbuff_free(&black_key_colors);
+            for (int i = 0; i < WHITE_KEY_NUM; i++) {
+                // if there should be a black key to the right of the current white key...
+                if (white_key_types[i] == KEY_LEFT or white_key_types[i] == KEY_CENTER) {
+                    // add it to the position buffer!
+                    sbuff_push_back(&black_key_positions, white_key_positions[i] + V3(0.16, 0.0, -0.34));
+                    sbuff_push_back(&black_key_colors, monokai.blue);
                 }
             }
-            else if (mode == SKELETON_ANIMATION_MODE_RIGID) {
-                // TODO: bind the node completely to its closest bone
-                // (after you get this right, the skin should look "like a robot" / "rigid")
-
-            }
-            else if (mode == SKELETAL_ANIMATION_MODE_SMOOTH) {
-                // TODO (tricky): smoothly blend the weights between nearby bones
-                // (after you get this right, the skin should look "squishy" / "smooth")
-
-            }
         }
-
-        { // normalize weights (ensure they sum(w_i) is 1)
-            real sum = 0;
-            for (int j = 0; j < NUM_BONES; ++j) {
-                sum += w_i[j];
-            }
-
-            for (int j = 0; j < NUM_BONES; ++j) {
-                w_i[j] /= sum;
-            }
-        }
-
-        { // write w_i -> weights[i]
-            for (int j = 0; j < NUM_BONES; ++j) {
-                weights[i][j] = w_i[j];
-            }
-        }
-    }
-}
-
-
-void hw10b() {
-    real **weights[_SKELETAL_ANIMATION_MODE_COUNT] = {}; {
-        for (int mode = 0; mode < _SKELETAL_ANIMATION_MODE_COUNT; ++mode) {
-            weights[mode] = (real **) calloc(NUM_NODES, sizeof(real *));
-            for (int i = 0; i < NUM_NODES; ++i) {
-                weights[mode][i] = (real *) calloc(NUM_BONES, sizeof(real));
-            }
-        }
-    }
-    real L[NUM_BONES] = {};
-    real _phi[NUM_BONES] = {};
-    real theta[NUM_BONES] = {};
-    vec2 b[NUM_BONES + 1] = {};
-    vec2 b_bind[NUM_BONES + 1] = {};
-    vec2 s[NUM_NODES] = {};
-    vec2 s_bind[NUM_NODES] = {};
-
-    { // initialize
-        // bones
-        for (int j = 0; j < NUM_BONES; ++j) {
-            L[j] = LERP(real(j) / MAX(1, NUM_BONES - 1), 2.5, 1);
-            b_bind[j + 1] = b_bind[j] + V2(L[j], 0);
-        }
-
-        // skin
+        
+        // react to key presses 
         {
-            // bind pose as a loop
-            // e.g., for 10 nodes:
-            // 9 8 7 6 5          
-            // 0 1 2 3 4          
-            int k = 0;
-            for (int sign = -1; sign <= 1; sign += 2) {
-                for (int i = 0; i < NUM_NODES / 2; ++i) {
-                    real f = real(i) / real(NUM_NODES / 2 - 1);
-                    if (sign > 0) { f = 1 - f; }
-                    real skeleton_total_length = b_bind[NUM_BONES].x;
-                    s_bind[k++] = V2(skeleton_total_length * f, .3 * sign);
-                }
-            }
+        if (globals.key_pressed['a']) {
+            tags[21 + 0 + (12 * octave)] = data.voicer.noteOn(21 + 0 + (12 * octave), 64);
+            play_white_note(0, tags, octave, white_key_colors, white_key_positions); 
+        }
+        if (globals.key_released['a']) {
+            data.voicer.noteOff(tags[21 + 0 + (12 * octave)], 64);
+            stop_white_note(0, tags, octave, white_key_colors, white_key_positions);
+        }
+        if (globals.key_pressed['s']) {
+            tags[21 + 2 + (12 * octave)] = data.voicer.noteOn(21 + 2 + (12 * octave), 64);
+            play_white_note(1, tags, octave, white_key_colors, white_key_positions); 
+        }
+        if (globals.key_released['s']) {
+            data.voicer.noteOff(tags[21 + 2 + (12 * octave)], 64);
+            stop_white_note(1, tags, octave, white_key_colors, white_key_positions);
+        }
+        if (globals.key_pressed['d']) {
+            tags[21 + 3 + (12 * octave)] = data.voicer.noteOn(21 + 3 + (12 * octave), 64);
+            play_white_note(2, tags, octave, white_key_colors, white_key_positions); 
+        }
+        if (globals.key_released['d']) {
+            data.voicer.noteOff(tags[21 + 3 + (12 * octave)], 64);
+            stop_white_note(2, tags, octave, white_key_colors, white_key_positions);
+        }
+        if (globals.key_pressed['f']) {
+            tags[21 + 5 + (12 * octave)] = data.voicer.noteOn(21 + 5 + (12 * octave), 64);
+            play_white_note(3, tags, octave, white_key_colors, white_key_positions);
+        }
+        if (globals.key_released['f']) {
+            data.voicer.noteOff(tags[21 + 5 + (12 * octave)], 64);
+            stop_white_note(3, tags, octave, white_key_colors, white_key_positions);
+        }
+        if (globals.key_pressed['g']) {
+            tags[21 + 7 + (12 * octave)] = data.voicer.noteOn(21 + 7 + (12 * octave), 64);
+            play_white_note(4, tags, octave, white_key_colors, white_key_positions);
+        }
+        if (globals.key_released['g']) {
+            data.voicer.noteOff(tags[21 + 7 + (12 * octave)], 64);
+            stop_white_note(4, tags, octave, white_key_colors, white_key_positions);
+        }
+        if (globals.key_pressed['h']) {
+            tags[21 + 8 + (12 * octave)] = data.voicer.noteOn(21 + 8 + (12 * octave), 64);
+            play_white_note(5, tags, octave, white_key_colors, white_key_positions);
+        }
+        if (globals.key_released['h']) {
+            data.voicer.noteOff(tags[21 + 8 + (12 * octave)], 64);
+            stop_white_note(5, tags, octave, white_key_colors, white_key_positions);
+        }
+        if (globals.key_pressed['j']) {
+            tags[21 + 10 + (12 * octave)] = data.voicer.noteOn(21 + 10 + (12 * octave), 64);
+            play_white_note(6, tags, octave, white_key_colors, white_key_positions);
+        }
+        if (globals.key_released['j']) {
+            data.voicer.noteOff(tags[21 + 10 + (12 * octave)], 64);
+            stop_white_note(6, tags, octave, white_key_colors, white_key_positions);
+        }
+        if (globals.key_pressed['k']) {
+            tags[21 + 12 + (12 * octave)] = data.voicer.noteOn(21 + 12 + (12 * octave), 64);
+            play_white_note(7, tags, octave, white_key_colors, white_key_positions);
+        }
+        if (globals.key_released['k']) {
+            data.voicer.noteOff(tags[21 + 12 + (12 * octave)], 64);
+            stop_white_note(7, tags, octave, white_key_colors, white_key_positions);
+        } 
+
+        if (globals.key_pressed['w']) {
+            tags[22 + 0 + (12 * octave)] = data.voicer.noteOn(22 + 0 + (12 * octave), 64);
+            play_black_note(0, tags, octave, black_key_colors, black_key_positions);
+        }
+        if (globals.key_released['w']) {
+            data.voicer.noteOff(tags[22 + 0 + (12 * octave)], 64);
+            stop_black_note(0, tags, octave, black_key_colors, black_key_positions);
+        }
+        if (globals.key_pressed['r']) {
+            tags[22 + 3 + (12 * octave)] = data.voicer.noteOn(22 + 3 + (12 * octave), 64);
+            play_black_note(1, tags, octave, black_key_colors, black_key_positions);
+        }
+        if (globals.key_released['r']) {
+            data.voicer.noteOff(tags[22 + 3 + (12 * octave)], 64);
+            stop_black_note(1, tags, octave, black_key_colors, black_key_positions);
+        }
+        if (globals.key_pressed['t']) {
+            tags[22 + 5 + (12 * octave)] = data.voicer.noteOn(22 + 5 + (12 * octave), 64);
+            play_black_note(2, tags, octave, black_key_colors, black_key_positions);
+        }
+        if (globals.key_released['t']) {
+            data.voicer.noteOff(tags[22 + 5 + (12 * octave)], 64);
+            stop_black_note(2, tags, octave, black_key_colors, black_key_positions);
+        }
+        if (globals.key_pressed['u']) {
+            tags[22 + 8 + (12 * octave)] = data.voicer.noteOn(22 + 8 + (12 * octave), 64);
+            play_black_note(3, tags, octave, black_key_colors, black_key_positions);
+        }
+        if (globals.key_released['u']) {
+            data.voicer.noteOff(tags[22 + 8 + (12 * octave)], 64);
+            stop_black_note(3, tags, octave, black_key_colors, black_key_positions);
+        }
+        if (globals.key_pressed['u']) {
+            tags[22 + 10 + (12 * octave)] = data.voicer.noteOn(22 + 10 + (12 * octave), 64);
+            play_black_note(4, tags, octave, black_key_colors, black_key_positions);
+        }
+        if (globals.key_released['u']) {
+            data.voicer.noteOff(tags[22 + 10 + (12 * octave)], 64);
+            stop_black_note(4, tags, octave, black_key_colors, black_key_positions);
+        } 
         }
 
-        for (int mode = 0; mode < _SKELETAL_ANIMATION_MODE_COUNT; ++mode) {
-            initialize_weights(weights[mode], mode, s_bind, b_bind);
+        // draw white keys
+        { for (int i = 0; i < WHITE_KEY_NUM; i++) {
+            if (white_key_types[i] == KEY_FULL) {
+                draw_full_white_key(P, V, M, white_key_positions[i], white_key_colors[i]);
+            } else if (white_key_types[i] == KEY_LEFT) {
+                draw_left_white_key(P, V, M, white_key_positions[i], white_key_colors[i]);
+            } else if (white_key_types[i] == KEY_RIGHT) {
+                draw_right_white_key(P, V, M, white_key_positions[i], white_key_colors[i]);
+            } else if (white_key_types[i] == KEY_CENTER) {
+                draw_center_white_key(P, V, M, white_key_positions[i], white_key_colors[i]);
+            }
+        } }
+
+        // draw black keys
+        for (int i = 0; i < black_key_num; i++) {
+            draw_black_key(P, V, M, black_key_positions[i], black_key_colors[i]);
         }
     }
+}
 
-    // tweaks
-    bool draw_character = false;
-    bool draw_bind_pose = false;
-    bool hide_skeleton = false;
-    bool hide_nodes = false;
-    bool hide_plots = false;
+// from stk, example crtsine.cpp
+// This tick() function handles sample computation only.  It will be
+// called automatically when the system needs a new buffer of audio
+// samples.
+int tick_sine( void *outputBuffer, void *inputBuffer, unsigned int nBufferFrames,
+         double streamTime, RtAudioStreamStatus status, void *dataPointer )
+{
+  SineWave *sine = (SineWave *) dataPointer;
+  register StkFloat *samples = (StkFloat *) outputBuffer;
 
-    // debug play
-    bool debug_play = false;
-    real debug_time = 0;
+  for ( unsigned int i=0; i<nBufferFrames; i++ )
+    *samples++ = sine->tick();
 
-    // keyframing system
-    #define MAX_KEYFRAMES 1024
-    real keyframes[MAX_KEYFRAMES][NUM_BONES] = {};
-    int num_keyframes = 0;
-    bool tween_keyframes = false;
-    const int FRAMES_PER_KEYFRAME = 32;
-    int frame = 0;
+  return 0;
+}
 
-    Camera2D camera = { 10, 0, 2 };
-    int mode = 0;
+void sine() {
+    // Set the global sample rate before creating class instances.
+    Stk::setSampleRate( 44100.0 );
+
+    SineWave sine;
+    RtAudio dac;
+
+    // Figure out how many bytes in an StkFloat and setup the RtAudio stream.
+    RtAudio::StreamParameters parameters;
+    parameters.deviceId = dac.getDefaultOutputDevice();
+    parameters.nChannels = 1;
+    RtAudioFormat format = ( sizeof(StkFloat) == 8 ) ? RTAUDIO_FLOAT64 : RTAUDIO_FLOAT32;
+    unsigned int bufferFrames = RT_BUFFER_SIZE;
+    
+    dac.openStream( &parameters, NULL, format, (unsigned int)Stk::sampleRate(), &bufferFrames, &tick_sine, (void *)&sine );
+
+    real frequency = 440.0;
+
+    while(cow_begin_frame()) {
+        gui_slider("frequency", &frequency, 100.0, 600.0);
+        sine.setFrequency(frequency);
+
+        if (globals.key_pressed[COW_KEY_SPACE]) {
+            dac.startStream();
+        }
+        if (globals.key_released[COW_KEY_SPACE]) {
+            dac.stopStream();
+        }
+    }
+}
+
+void synth()
+{
+    // Set the global sample rate and rawwave path before creating class instances.
+    Stk::setSampleRate( 44100.0 );
+    Stk::setRawwavePath( "stk/rawwaves/" );
+
+    int i;
+    TickData data;
+    RtAudio dac;
+    Instrmnt *instrument[6];
+    for ( i=0; i<6; i++ ) { 
+        instrument[i] = 0;
+    }
+
+    // Figure out how many bytes in an StkFloat and setup the RtAudio stream.
+    RtAudio::StreamParameters parameters;
+    parameters.deviceId = dac.getDefaultOutputDevice();
+    parameters.nChannels = 1;
+    RtAudioFormat format = ( sizeof(StkFloat) == 8 ) ? RTAUDIO_FLOAT64 : RTAUDIO_FLOAT32;
+    unsigned int bufferFrames = RT_BUFFER_SIZE;
+
+    dac.openStream( &parameters, NULL, format, (unsigned int)Stk::sampleRate(), &bufferFrames, &tick_synth, (void *)&data );
+
+    // Define and load the instruments
+    for ( i=0; i<6; i++ ) {
+        instrument[i] = new Mandolin(50.0);
+    }
+
+    // Add the instruments to the voicer.
+    for ( i=0; i<6; i++ ) {
+        data.voicer.addInstrument( instrument[i] );
+    }
+
+    dac.startStream();
+    long tags[128];
+
+    while (cow_begin_frame()) {
+        if (globals.key_pressed['a']) {
+            tags[60] = data.voicer.noteOn(60, 64);
+        }
+        if (globals.key_released['a']) {
+            data.voicer.noteOff(tags[60], 64);
+        }
+
+        if (globals.key_pressed['s']) {
+            tags[62] = data.voicer.noteOn(62, 64);
+        }
+        if (globals.key_released['s']) {
+            data.voicer.noteOff(tags[62], 64);
+        }
+
+        if (globals.key_pressed['d']) {
+            tags[64] = data.voicer.noteOn(64, 64);
+        }
+        if (globals.key_released['d']) {
+            data.voicer.noteOff(tags[64], 64);
+        }
+
+        if (globals.key_pressed['f']) {
+            tags[65] = data.voicer.noteOn(65, 64);
+        }
+        if (globals.key_released['f']) {
+            data.voicer.noteOff(tags[65], 64);
+        }
+
+        if (globals.key_pressed['g']) {
+            tags[67] = data.voicer.noteOn(67, 64);
+        }
+        if (globals.key_released['g']) {
+            data.voicer.noteOff(tags[67], 64);
+        }
+
+        if (globals.key_pressed['h']) {
+            tags[69] = data.voicer.noteOn(69, 64);
+        }
+        if (globals.key_released['h']) {
+            data.voicer.noteOff(tags[69], 64);
+        }
+
+        if (globals.key_pressed['j']) {
+            tags[71] = data.voicer.noteOn(71, 64);
+        }
+        if (globals.key_released['j']) {
+            data.voicer.noteOff(tags[71], 64);
+        }
+
+        if (globals.key_pressed['k']) {
+            tags[72] = data.voicer.noteOn(72, 64);
+        }
+        if (globals.key_released['k']) {
+            data.voicer.noteOff(tags[72], 64);
+        }
+    }
+}
+
+void shader() {
+    char *fragment_shader_source = _load_file_into_char_array("piano_shader.frag");
+    char *vertex_shader_source = R""(
+        #version 330 core
+        layout (location = 0) in vec3 vertex_position;
+        void main() {
+            gl_Position = vec4(vertex_position, 1.0);
+        }
+    )"";
+
+    Shader shader = shader_create(vertex_shader_source, 1, fragment_shader_source);
+
+    IndexedTriangleMesh3D mesh = library.meshes.square;
+    Camera3D camera = { 5.0 };
+    real iTime = 0.0;
+
+    // stk instrument setup code
+    // set the global sample rate and rawwave path
+    Stk::setSampleRate( 44100.0 );
+    Stk::setRawwavePath( "stk/rawwaves/" );
+
+    int i;
+    TickData data;
+    RtAudio dac;
+    Instrmnt *instrument[6];
+    for ( i=0; i<6; i++ ) { 
+        instrument[i] = 0;
+    }
+
+    // setup the RtAudio stream
+    RtAudio::StreamParameters parameters;
+    parameters.deviceId = dac.getDefaultOutputDevice();
+    parameters.nChannels = 1;
+    RtAudioFormat format = ( sizeof(StkFloat) == 8 ) ? RTAUDIO_FLOAT64 : RTAUDIO_FLOAT32;
+    unsigned int bufferFrames = RT_BUFFER_SIZE;
+
+    dac.openStream( &parameters, NULL, format, (unsigned int)Stk::sampleRate(), &bufferFrames, &tick_synth, (void *)&data );
+
+    // define and load the instruments
+    for ( i=0; i<6; i++ ) {
+        instrument[i] = new Wurley();
+    }
+
+    // add the instruments to the voicer
+    for ( i=0; i<6; i++ ) {
+        data.voicer.addInstrument( instrument[i] );
+    }
+
+    dac.startStream();
+    long tags[128];
+
+    // initialize key data buffers
+    StretchyBuffer<vec3> white_key_pressed = {};
+    for (int i = 0; i < 52; i++) {
+        sbuff_push_back(&white_key_pressed, V3(0.0));        
+    }
+    StretchyBuffer<vec3> black_key_pressed = {};
+    for (int i = 0; i < 52; i++) {
+        sbuff_push_back(&black_key_pressed, V3(0.0));  
+    }
+
+    int octave = 4;
+
+    real light_x = 5.6;
+    real light_y = 8.7;
+    real light_z = 8.8;
+
+    real spotlight_x = 6.0;
+    real spotlight_y = 10.0;
+    real spotlight_z = 0.0;
+
+    bool autoplay = false;
+
     while (cow_begin_frame()) {
         camera_move(&camera);
-        mat4 PV = camera_get_PV(&camera);
+        iTime += 0.0167;
+        spotlight_x = (sin(iTime) * 6) + 6;
+        spotlight_z = (sin(1.3 * iTime) * 3) - 1;
 
-        { // compute absolute angles
-            for (int j = 0; j < NUM_BONES; ++j) {
-                theta[j] = ((j == 0) ? 0.0 : theta[j - 1]) + _phi[j];
+        // switching octaves
+        if(globals.key_pressed['m'] && octave < 7) {
+            octave += 1;
+        }
+        if (globals.key_pressed['n'] && octave > 0) {
+            octave -= 1;
+        }
+
+        // switching instruments
+        { if (globals.key_pressed['1']) {
+            for ( i=0; i<6; i++ ) {
+                data.voicer.removeInstrument(instrument[i]);
+            }
+            for ( i=0; i<6; i++ ) {
+                instrument[i] = new Wurley();
+            }
+            for ( i=0; i<6; i++) {
+                data.voicer.addInstrument( instrument[i] );
+            }
+        }
+        if (globals.key_pressed['2']) {
+            for ( i=0; i<6; i++ ) {
+                data.voicer.removeInstrument(instrument[i]);
+            }
+            for ( i=0; i<6; i++ ) {
+                instrument[i] = new Clarinet();
+            }
+            for ( i=0; i<6; i++) {
+                data.voicer.addInstrument( instrument[i] );
+            }
+        }
+        if (globals.key_pressed['3']) {
+            for ( i=0; i<6; i++ ) {
+                data.voicer.removeInstrument(instrument[i]);
+            }
+            for ( i=0; i<6; i++ ) {
+                instrument[i] = new Mandolin(100);
+            }
+            for ( i=0; i<6; i++) {
+                data.voicer.addInstrument( instrument[i] );
+            }
+        }
+        if (globals.key_pressed['4']) {
+            for ( i=0; i<6; i++ ) {
+                data.voicer.removeInstrument(instrument[i]);
+            }
+            for ( i=0; i<6; i++ ) {
+                instrument[i] = new Bowed();
+            }
+            for ( i=0; i<6; i++) {
+                data.voicer.addInstrument( instrument[i] );
+            }
+        } }
+
+        gui_checkbox("play autonomously", &autoplay);
+
+        // generate music using pentatonic scale
+        if (autoplay) {
+            real val = random_real(0, 10000);
+            if (val > 9500) {
+                if (octave == 0) {
+                    octave += 1;
+                } else if (octave == 7) {
+                    octave -= 1;
+                } else {
+                    octave += int(random_sign());
+                }
+            }
+            if (val > 9000) {
+                // stop all notes
+                for (int i = 0; i < 52; i++) {
+                    data.voicer.noteOff(tags[21 + i], 64);
+                    white_key_pressed[i] = V3(0.0);
+                }
+            }
+            if (val > 8800) {
+                // play a note
+                int note = floor(random_real(0, 7.99));
+                if (!(note == 1 or note == 5)) {
+                    tags[21 + note + (12 * octave)] = data.voicer.noteOn(21 + note + (12 * octave), 64);
+                    white_key_pressed[note + (7 * octave)] = V3(1.0);
+                }
             }
         }
 
-        update_skeleton(b, L, theta);
-        update_skin(s, weights[mode], b, theta, b_bind, s_bind);
-
-        { // keyframing
-            // animate the skeleton (i.e., set _phi using whatever method you like)
-            // METHOD 1: press 'p' to play a sinusoidal trajectory                                 
-            // METHOD 2: press 's' to save keyframes; press 't' to play them back with lerp        
-            if (tween_keyframes && num_keyframes > 0) {
-                int frame_A = (frame / FRAMES_PER_KEYFRAME) % num_keyframes;
-                int frame_B = (frame_A + 1) % num_keyframes;
-                real t = real(frame % FRAMES_PER_KEYFRAME) / FRAMES_PER_KEYFRAME;
-                for (int j = 0; j < NUM_BONES; ++j) {
-                    _phi[j] = LERP(
-                            t,
-                            keyframes[frame_A][j],
-                            keyframes[frame_B][j]);
-                }
-                ++frame;
-            } else if (debug_play) {
-                for (int j = 0; j < NUM_BONES; ++j) {
-                    _phi[j] += .02 * cos((j + 1) * debug_time / 2);
-                }
-                debug_time += .0167;
-            }
+        // react to key presses 
+        {
+        if (globals.key_pressed['a']) {
+            tags[21 + 0 + (12 * octave)] = data.voicer.noteOn(21 + 0 + (12 * octave), 64);
+            white_key_pressed[0 + (7 * octave)] = V3(1.0);
+        }
+        if (globals.key_released['a']) {
+            data.voicer.noteOff(tags[21 + 0 + (12 * octave)], 64);
+            white_key_pressed[0 + (7 * octave)] = V3(0.0);
+        }
+        if (globals.key_pressed['s']) {
+            tags[21 + 2 + (12 * octave)] = data.voicer.noteOn(21 + 2 + (12 * octave), 64);
+            white_key_pressed[1 + (7 * octave)] = V3(1.0);
+        }
+        if (globals.key_released['s']) {
+            data.voicer.noteOff(tags[21 + 2 + (12 * octave)], 64);
+            white_key_pressed[1 + (7 * octave)] = V3(0.0);
+        }
+        if (globals.key_pressed['d']) {
+            tags[21 + 3 + (12 * octave)] = data.voicer.noteOn(21 + 3 + (12 * octave), 64);
+            white_key_pressed[2 + (7 * octave)] = V3(1.0);
+        }
+        if (globals.key_released['d']) {
+            data.voicer.noteOff(tags[21 + 3 + (12 * octave)], 64);
+            white_key_pressed[2 + (7 * octave)] = V3(0.0);
+        }
+        if (globals.key_pressed['f'] && octave < 7) {
+            tags[21 + 5 + (12 * octave)] = data.voicer.noteOn(21 + 5 + (12 * octave), 64);
+            white_key_pressed[3 + (7 * octave)] = V3(1.0);
+        }
+        if (globals.key_released['f'] && octave < 7) {
+            data.voicer.noteOff(tags[21 + 5 + (12 * octave)], 64);
+            white_key_pressed[3 + (7 * octave)] = V3(0.0);
+        }
+        if (globals.key_pressed['g'] && octave < 7) {
+            tags[21 + 7 + (12 * octave)] = data.voicer.noteOn(21 + 7 + (12 * octave), 64);
+            white_key_pressed[4 + (7 * octave)] = V3(1.0);
+        }
+        if (globals.key_released['g'] && octave < 7) {
+            data.voicer.noteOff(tags[21 + 7 + (12 * octave)], 64);
+            white_key_pressed[4 + (7 * octave)] = V3(0.0);
+        }
+        if (globals.key_pressed['h'] && octave < 7) {
+            tags[21 + 8 + (12 * octave)] = data.voicer.noteOn(21 + 8 + (12 * octave), 64);
+            white_key_pressed[5 + (7 * octave)] = V3(1.0);
+        }
+        if (globals.key_released['h'] && octave < 7) {
+            data.voicer.noteOff(tags[21 + 8 + (12 * octave)], 64);
+            white_key_pressed[5 + (7 * octave)] = V3(0.0);
+        }
+        if (globals.key_pressed['j'] && octave < 7) {
+            tags[21 + 10 + (12 * octave)] = data.voicer.noteOn(21 + 10 + (12 * octave), 64);
+            white_key_pressed[6 + (7 * octave)] = V3(1.0);
+        }
+        if (globals.key_released['j'] && octave < 7) {
+            data.voicer.noteOff(tags[21 + 10 + (12 * octave)], 64);
+            white_key_pressed[6 + (7 * octave)] = V3(0.0);
+        }
+        if (globals.key_pressed['k'] && octave < 7) {
+            tags[21 + 12 + (12 * octave)] = data.voicer.noteOn(21 + 12 + (12 * octave), 64);
+            white_key_pressed[7 + (7 * octave)] = V3(1.0);
+        }
+        if (globals.key_released['k'] && octave < 7) {
+            data.voicer.noteOff(tags[21 + 12 + (12 * octave)], 64);
+            white_key_pressed[7 + (7 * octave)] = V3(0.0);
+        } 
+        if (globals.key_pressed['w']) {
+            tags[22 + 0 + (12 * octave)] = data.voicer.noteOn(22 + 0 + (12 * octave), 64);
+            black_key_pressed[0 + (7 * octave)] = V3(1.0);
+        }
+        if (globals.key_released['w']) {
+            data.voicer.noteOff(tags[22 + 0 + (12 * octave)], 64);
+            black_key_pressed[0 + (7 * octave)] = V3(0.0);
+        }
+        if (globals.key_pressed['r'] && octave < 7) {
+            tags[22 + 3 + (12 * octave)] = data.voicer.noteOn(22 + 3 + (12 * octave), 64);
+            black_key_pressed[2 + (7 * octave)] = V3(1.0);
+        }
+        if (globals.key_released['r'] && octave < 7) {
+            data.voicer.noteOff(tags[22 + 3 + (12 * octave)], 64);
+            black_key_pressed[2 + (7 * octave)] = V3(0.0);
+        }
+        if (globals.key_pressed['t'] && octave < 7) {
+            tags[22 + 5 + (12 * octave)] = data.voicer.noteOn(22 + 5 + (12 * octave), 64);
+            black_key_pressed[3 + (7 * octave)] = V3(1.0);
+        }
+        if (globals.key_released['t'] && octave < 7) {
+            data.voicer.noteOff(tags[22 + 5 + (12 * octave)], 64);
+            black_key_pressed[3 + (7 * octave)] = V3(0.0);
+        }
+        if (globals.key_pressed['u'] && octave < 7) {
+            tags[22 + 8 + (12 * octave)] = data.voicer.noteOn(22 + 8 + (12 * octave), 64);
+            black_key_pressed[5 + (7 * octave)] = V3(1.0);
+        }
+        if (globals.key_released['u'] && octave < 7) {
+            data.voicer.noteOff(tags[22 + 8 + (12 * octave)], 64);
+            black_key_pressed[5 + (7 * octave)] = V3(0.0);
+        }
+        if (globals.key_pressed['i'] && octave < 7) {
+            tags[22 + 10 + (12 * octave)] = data.voicer.noteOn(22 + 10 + (12 * octave), 64);
+            black_key_pressed[6 + (7 * octave)] = V3(1.0);
+        }
+        if (globals.key_released['i'] && octave < 7) {
+            data.voicer.noteOff(tags[22 + 10 + (12 * octave)], 64);
+            black_key_pressed[6 + (7 * octave)] = V3(0.0);
+        } 
         }
 
-        { // gui
-            for (int j = 0; j < NUM_BONES; ++j) {
-                char buffer[24];
-                sprintf(buffer, "joint angle %d", j);
-                gui_slider(buffer, _phi + j, -PI, PI, true);
-            }
-            gui_printf("");
-            gui_slider("mode", &mode, 0, _SKELETAL_ANIMATION_MODE_COUNT - 1, 'j', 'k', true);
-            gui_printf("mode: %s", skeletal_animation_mode_names[mode]);
-            if (!hide_plots) {
-                mat4 PV_plot = M4_Translation(0, .25) * M4_Scaling(.78, .5 * .5 * _window_get_aspect());
-                static vec2 trace[NUM_NODES / 2];
-                {
-                    vec2 axes[] = { { 1, 0 }, { 0, 0 }, { 0, 1 } };
-                    soup_draw(PV_plot, SOUP_LINE_STRIP, 3, axes, NULL, monokai.gray);
-                    text_draw(PV_plot, "x_rest", axes[0]);
-                    text_draw(PV_plot, "weight", axes[2], V3(1, 1, 1), 0, { 0, -24 });
-                }
-                for (int j = 0; j < NUM_BONES; ++j) {
-                    for (int i = 0; i < NUM_NODES / 2; ++i) {
-                        trace[i] = { real(i) / real(NUM_NODES / 2 - 1), weights[mode][i][j] };
-                    }
-                    soup_draw(PV_plot, SOUP_LINE_STRIP, NUM_NODES / 2, trace, NULL, color_kelly(j));
-                }
-            }
-            gui_printf("");
-            gui_checkbox("debug_play", &debug_play, 'p');
-            gui_printf("");
-            if (gui_button("save keyframe", 's') && num_keyframes < MAX_KEYFRAMES) {
-                for (int j = 0; j < NUM_BONES; ++j) {
-                    keyframes[num_keyframes][j] = _phi[j];
-                }
-                ++num_keyframes;
-            }
-            gui_checkbox("tween keyframes", &tween_keyframes, 't');
-            gui_readout("num_keyframes", &num_keyframes);
-            gui_printf("");
-            { // reset
-                static real _bone_relative_angles_0[NUM_BONES];
-                do_once { memcpy(_bone_relative_angles_0, _phi, sizeof(_phi)); };
-                if (gui_button("reset", 'r')) {
-                    memcpy(_phi, _bone_relative_angles_0, sizeof(_phi));
+        shader_set_uniform(&shader, "iTime", iTime);
+        shader_set_uniform(&shader, "iResolution", window_get_size());
+        shader_set_uniform(&shader, "C", camera_get_C(&camera));
 
-                    debug_time = 0;
+        shader_set_uniform(&shader, "lightPos", V3(light_x, light_y, light_z));
+        shader_set_uniform(&shader, "spotlightPos", V3(spotlight_x, spotlight_y, spotlight_z));
 
-                    memset(keyframes, 0, sizeof(keyframes));
-                    num_keyframes = 0;
-                    tween_keyframes = false;
-                    frame = 0;
-                }
-            }
-            gui_printf("");
-            gui_checkbox("draw_character", &draw_character, 'z');
-            gui_checkbox("draw_bind_pose", &draw_bind_pose, 'x');
-            gui_checkbox("hide_skeleton", &hide_skeleton, 'c');
-            gui_checkbox("hide_nodes", &hide_nodes, 'v');
-            gui_checkbox("hide_plots", &hide_plots, 'b');
-        }
+        shader_set_uniform(&shader, "white_key_pressed", white_key_pressed.length, white_key_pressed.data);
+        shader_set_uniform(&shader, "black_key_pressed", black_key_pressed.length, black_key_pressed.data);
+        shader_set_uniform(&shader, "octave", octave);
 
-        { // draw
-            if (!hide_skeleton) {
-                eso_begin(PV, GL_LINES); {
-                    for (int j = 0; j < NUM_BONES; ++j) {
-                        eso_color(color_kelly(j));
-                        eso_vertex(b[j]);
-                        eso_vertex(b[j + 1]);
-                    }
-                } eso_end();
-                soup_draw(PV, SOUP_POINTS, NUM_BONES + 1, b, NULL, monokai.white);
-            }
-
-            if (draw_bind_pose) {
-                soup_draw(PV, SOUP_POINTS, NUM_BONES + 1, b_bind, NULL, monokai.blue);
-                soup_draw(PV, SOUP_LINE_STRIP, NUM_BONES + 1, b_bind, NULL, monokai.blue);
-                soup_draw(PV, SOUP_LINE_LOOP, NUM_NODES, s_bind, NULL, .5 * monokai.blue);
-                soup_draw(PV, SOUP_POINTS, NUM_NODES, s_bind, NULL, monokai.blue, 8.0);
-            }
-
-            if (!hide_nodes) {
-                static vec3 *node_colors = (vec3 *) malloc(NUM_NODES * sizeof(vec3));
-                for (int i = 0; i < NUM_NODES; ++i) {
-                    node_colors[i] = {};
-                    for (int j = 0; j < NUM_BONES; ++j) {
-                        node_colors[i] += weights[mode][i][j] * color_kelly(j);
-                    }
-                }
-                soup_draw(PV, SOUP_LINE_LOOP, NUM_NODES, s, node_colors, {}, 4.0);
-                soup_draw(PV, SOUP_POINTS, NUM_NODES, s, node_colors, {}, 9.0);
-            }
-
-            if (draw_character) {
-                const int NUM_QUADS = (NUM_NODES / 2 - 1);
-                static vec2 vertex_positions[4 * NUM_QUADS];
-                static vec3 vertex_colors[4 * NUM_QUADS];
-                for (int i = 0; i < NUM_QUADS; ++i) {
-                    vertex_positions[4 * i + 0] = s[i];
-                    vertex_positions[4 * i + 1] = s[i + 1];
-                    vertex_positions[4 * i + 2] = s[NUM_NODES - 1 - (i + 1)];
-                    vertex_positions[4 * i + 3] = s[NUM_NODES - 1 - (i)];
-                    real f = real(i) / (NUM_QUADS - 1);
-                    vec3 color = color_rainbow_swirl(f);
-                    vertex_colors[4 * i + 0] = color;
-                    vertex_colors[4 * i + 1] = color;
-                    vertex_colors[4 * i + 2] = color;
-                    vertex_colors[4 * i + 3] = color;
-                }
-                soup_draw(PV, SOUP_QUADS, 4 * NUM_QUADS, vertex_positions, vertex_colors);
-            }
-        }
+        shader_pass_vertex_attribute(&shader, mesh.num_vertices, mesh.vertex_positions);
+        shader_draw(&shader, mesh.num_triangles, mesh.triangle_indices);
     }
 }
-
-
+  
 int main() {
+    _cow_init();
     APPS {
-        APP(hw10a);
-        APP(hw10b);
+        APP(shader);
+        APP(final_project);
+        APP(sine);
+        APP(synth);
     }
     return 0;
 }

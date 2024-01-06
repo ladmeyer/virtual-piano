@@ -26,6 +26,8 @@
 #define STB_IMAGE_IMPLEMENTATION
 #include "ext/stb_image.h"
 #include "ext/jo_mpeg.h"
+
+#ifndef COW_NO_SOUND
 #ifdef COW_OS_APPLE
 #define CUTE_SOUND_SCALAR_MODE
 #pragma clang diagnostic push
@@ -39,6 +41,8 @@
 #ifdef COW_OS_APPLE
 #pragma clang diagnostic pop
 #endif
+#endif
+
 
 #ifdef COW_OS_UBUNTU
 #define GL_GLEXT_PROTOTYPES
@@ -426,7 +430,7 @@ struct C1_PersistsAcrossFrames_AutomaticallyClearedToZeroBetweenAppsBycow_reset 
     u32  _mesh_textures[ITRI_MAX_NUM_TEXTURES];
     int  _mesh_num_textures;
 
-#ifndef COW_OS_UBUNTU
+#if !defined(COW_OS_UBUNTU) && !defined(COW_NO_SOUND)
     cs_audio_source_t *_sound_audio_source_ptrs[SOUND_MAX_DIFFERENT_FILES];
     char               _sound_filenames[SOUND_MAX_DIFFERENT_FILES][SOUND_MAX_FILENAME_LENGTH];
     int                _sound_num_loaded;
